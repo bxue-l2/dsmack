@@ -44,8 +44,9 @@ use std::io;
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
-#[cfg(any(target_os = "linux", target_os = "windows"))]
 use std::time::Duration;
+#[cfg(target_os = "macos")]
+use std::time::Instant;
 #[cfg(target_os = "windows")]
 use utils::windows::AsRawFd;
 
@@ -218,8 +219,14 @@ pub(crate) fn returning_unrecoverable(msg: &str) -> ! {
     // Fatal enforcement must not wait for a logger or a full diagnostic pipe.
     unsafe {
         let flags = libc::fcntl(libc::STDERR_FILENO, libc::F_GETFL);
-        if flags >= 0 && libc::fcntl(libc::STDERR_FILENO, libc::F_SETFL, flags | libc::O_NONBLOCK) == 0 {
-            for bytes in [b"DSMACK_RETURNING_UNRECOVERABLE ".as_slice(), msg.as_bytes(), b"\n".as_slice()] {
+        if flags >= 0
+            && libc::fcntl(libc::STDERR_FILENO, libc::F_SETFL, flags | libc::O_NONBLOCK) == 0
+        {
+            for bytes in [
+                b"DSMACK_RETURNING_UNRECOVERABLE ".as_slice(),
+                msg.as_bytes(),
+                b"\n".as_slice(),
+            ] {
                 let _ = libc::write(libc::STDERR_FILENO, bytes.as_ptr().cast(), bytes.len());
             }
         }
@@ -276,7 +283,7 @@ impl Vmm {
     }
 
     /// dsmack v3 F09 — mark the execution budget as satisfied by an IN-BUDGET
-    /// halt, so the independent watchdog exits without aborting and the
+    /// halt of every vCPU, so the independent watchdog exits without aborting and the
     /// subsequent (separately-bounded) teardown is not killed. MUST be called
     /// only after confirming the deadline had not already elapsed.
     #[cfg(target_os = "macos")]
@@ -512,11 +519,10 @@ impl Vmm {
     }
 
     /// Returning lifecycle, phase 1, called with the event loop stopped after `halted` is set.
-    /// The sole vCPU has reported `Exited` and is parked outside `hv_vcpu_run`, still a valid
-    /// interrupt target. Exit observers stop the console port workers (joining them, which may
-    /// inject guest interrupts); a worker panic, writer error or teardown timeout fails the
-    /// teardown so no exit code can be reported. Then each vCPU is destroyed on its own thread
-    /// and joined.
+    /// One vCPU has reported `Exited`. Stop all others before stopping device workers:
+    /// a guest must not enqueue more work while its devices are being torn down.
+    /// Keep every HVF interrupt target alive until those workers have joined, then
+    /// destroy each vCPU on its own thread. Failure prevents reporting a result.
     #[cfg(target_os = "macos")]
     pub(crate) fn stop_returning(&mut self) -> std::result::Result<u8, String> {
         let code = match self.halted {
@@ -524,6 +530,20 @@ impl Vmm {
             Some(None) => return Err("exit event without vCPU Exited response".into()),
             None => return Err("VMM has not halted".into()),
         };
+        let stop_deadline = Instant::now() + Duration::from_secs(5);
+        for handle in &self.vcpus_handles {
+            handle.request_stop()?;
+        }
+        for handle in &self.vcpus_handles {
+            handle.wait_stopped(stop_deadline)?;
+        }
+        if self
+            .exec_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Err("execution budget exceeded before all vCPUs stopped".into());
+        }
+        self.cancel_exec_watchdog();
         for observer in self.exit_observers.drain(..) {
             observer
                 .lock()
@@ -699,8 +719,8 @@ impl Subscriber for Vmm {
 #[cfg(test)]
 mod memory_lifetime_tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use vm_memory::{GuestAddress, GuestMemoryBackend};
 
     fn one_page_memory() -> GuestMemoryMmap {
@@ -731,8 +751,9 @@ mod memory_lifetime_tests {
         let destroy_calls = Arc::new(AtomicUsize::new(0));
         let calls = Arc::clone(&destroy_calls);
         let memory = one_page_memory();
-        let host_ptr =
-            memory.get_host_address(GuestAddress(0)).expect("host address") as *mut u64;
+        let host_ptr = memory
+            .get_host_address(GuestAddress(0))
+            .expect("host address") as *mut u64;
         assert!(addr_is_mapped(host_ptr as usize));
         let memory = std::mem::ManuallyDrop::new(memory);
         let result = destroy_then_release_guest_memory(
@@ -759,7 +780,9 @@ mod memory_lifetime_tests {
     #[test]
     fn successful_destroy_releases_after_destruction() {
         let memory = one_page_memory();
-        let host_addr = memory.get_host_address(GuestAddress(0)).expect("host address") as usize;
+        let host_addr = memory
+            .get_host_address(GuestAddress(0))
+            .expect("host address") as usize;
         assert!(addr_is_mapped(host_addr));
         let memory = std::mem::ManuallyDrop::new(memory);
         let result = destroy_then_release_guest_memory::<()>(|| Ok(()), memory);

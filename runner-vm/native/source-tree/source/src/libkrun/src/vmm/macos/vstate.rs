@@ -12,13 +12,13 @@ use std::io;
 use std::result;
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::super::{FC_EXIT_CODE_GENERIC_ERROR, FC_EXIT_CODE_OK};
 use crate::vmm::vmm_config::machine_config::CpuFeaturesTemplate;
 
 use arch::ArchMemoryInfo;
-use crossbeam_channel::{Receiver, Sender, after, select, unbounded};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, after, select, unbounded};
 use devices::legacy::VcpuList;
 use hvf::{HvfVcpu, HvfVm, VcpuExit, Vcpus};
 use utils::eventfd::EventFd;
@@ -204,6 +204,7 @@ pub struct Vcpu {
     response_sender: Sender<VcpuResponse>,
     // Returning lifecycle: after reporting `Exited`, keep the HVF vCPU alive until `Destroy`.
     returning: bool,
+    stop_requested: bool,
 
     vcpu_list: Arc<VcpuList>,
     nested_enabled: bool,
@@ -301,6 +302,7 @@ impl Vcpu {
             response_receiver: Some(response_receiver),
             response_sender,
             returning: false,
+            stop_requested: false,
             vcpu_list,
             nested_enabled,
         })
@@ -489,8 +491,20 @@ impl Vcpu {
         let (wfe_sender, wfe_receiver) = unbounded();
         self.vcpu_list.register(hvf_vcpuid, wfe_sender);
 
-        let entry_addr = if let Some(boot_receiver) = &self.boot_receiver {
-            boot_receiver.recv().unwrap()
+        let entry_addr = if let Some(boot_receiver) = self.boot_receiver.clone() {
+            // A secondary CPU may never receive CPU_ON. It must still join shutdown.
+            loop {
+                select! {
+                    recv(boot_receiver) -> entry => break entry.expect("CPU boot channel closed"),
+                    recv(self.event_receiver) -> event => {
+                        self.handle_event(event.expect("vCPU event channel closed"), &hvf_vcpu);
+                        if self.stop_requested {
+                            self.await_destroy(hvf_vcpu);
+                            return;
+                        }
+                    }
+                }
+            }
         } else {
             self.boot_entry_addr
         };
@@ -499,12 +513,15 @@ impl Vcpu {
             .set_initial_state(self.ipa_size, entry_addr, self.fdt_addr)
             .unwrap_or_else(|_| panic!("Can't set HVF vCPU {hvf_vcpuid} initial state"));
 
-        loop {
+        while !self.stop_requested {
             // An out-of-band pause request breaks the vCPU out of HVF via
             // `vcpu_request_exit` (-> Canceled), so we observe it here between
             // guest runs and freeze on this thread, where the HvfVcpu lives.
-            if let Ok(VcpuEvent::Pause) = self.event_receiver.try_recv() {
-                self.pause_and_park(&hvf_vcpu);
+            if let Ok(event) = self.event_receiver.try_recv() {
+                self.handle_event(event, &hvf_vcpu);
+                if self.stop_requested {
+                    break;
+                }
             }
             match self.run_emulation(&mut hvf_vcpu) {
                 // Emulation ran successfully, continue.
@@ -539,8 +556,15 @@ impl Vcpu {
     /// Returning lifecycle: this vCPU no longer runs guest code. It stays a valid HVF interrupt
     /// target until the coordinator has stopped the devices, then is destroyed on its own thread.
     fn await_destroy(&mut self, hvf_vcpu: HvfVcpu<'_>) {
+        if self.stop_requested {
+            self.response_sender.send(VcpuResponse::Stopped).unwrap();
+        }
         loop {
             match self.event_receiver.recv() {
+                Ok(VcpuEvent::Stop) => {
+                    // A CPU which requested SYSTEM_OFF is already parked here.
+                    self.response_sender.send(VcpuResponse::Stopped).unwrap();
+                }
                 Ok(VcpuEvent::Destroy) => {
                     let destroyed = hvf_vcpu.destroy();
                     if let Err(e) = &destroyed {
@@ -557,11 +581,17 @@ impl Vcpu {
         }
     }
 
+    fn handle_event(&mut self, event: VcpuEvent, hvf_vcpu: &HvfVcpu) {
+        match event {
+            VcpuEvent::Pause => self.pause_and_park(hvf_vcpu),
+            VcpuEvent::Stop => self.stop_requested = true,
+            _ => {}
+        }
+    }
+
     /// Park until woken by a device IRQ (`receiver`), the optional vtimer
-    /// `timeout`, or an out-of-band [`VcpuEvent::Pause`]. Watching the pause
-    /// channel here too is load-bearing: an idle vCPU blocks in this recv (not
-    /// in HVF), so `vcpu_request_exit` can't break it out — without this arm a
-    /// pause request would hang forever.
+    /// `timeout`, or a control event. An idle vCPU blocks in this recv, outside
+    /// HVF, so `vcpu_request_exit` alone cannot pause or stop it.
     fn wait_for_event(
         &mut self,
         hvf_vcpuid: u64,
@@ -572,20 +602,20 @@ impl Vcpu {
         if !self.vcpu_list.should_wait(hvf_vcpuid) {
             return;
         }
-        let paused = if let Some(timeout) = timeout {
+        let event = if let Some(timeout) = timeout {
             select! {
-                recv(receiver) -> r => { r.expect("WFE channel closed unexpectedly"); false }
-                recv(self.event_receiver) -> ev => matches!(ev, Ok(VcpuEvent::Pause)),
-                recv(after(timeout)) -> _ => false,
+                recv(receiver) -> r => { r.expect("WFE channel closed unexpectedly"); None }
+                recv(self.event_receiver) -> ev => Some(ev.expect("vCPU event channel closed")),
+                recv(after(timeout)) -> _ => None,
             }
         } else {
             select! {
-                recv(receiver) -> r => { r.expect("WFE channel closed unexpectedly"); false }
-                recv(self.event_receiver) -> ev => matches!(ev, Ok(VcpuEvent::Pause)),
+                recv(receiver) -> r => { r.expect("WFE channel closed unexpectedly"); None }
+                recv(self.event_receiver) -> ev => Some(ev.expect("vCPU event channel closed")),
             }
         };
-        if paused {
-            self.pause_and_park(hvf_vcpu);
+        if let Some(event) = event {
+            self.handle_event(event, hvf_vcpu);
         }
     }
 
@@ -611,6 +641,10 @@ impl Vcpu {
                     self.response_sender
                         .send(VcpuResponse::Resumed)
                         .expect("failed to send Resumed status");
+                    return;
+                }
+                Ok(VcpuEvent::Stop) => {
+                    self.stop_requested = true;
                     return;
                 }
                 Ok(_) => {}
@@ -645,6 +679,8 @@ pub enum VcpuEvent {
     /// (the wall-clock time the VM spent paused). The coordinator sends the
     /// same value to every vCPU so their counters stay synchronized.
     Resume(u64),
+    /// Returning lifecycle: stop guest execution, retaining the HVF interrupt target.
+    Stop,
     /// Returning lifecycle: destroy the HVF vCPU on its thread and end the thread.
     Destroy,
 }
@@ -658,6 +694,8 @@ pub enum VcpuResponse {
     Resumed,
     /// Vcpu is stopped.
     Exited(u8),
+    /// This CPU can no longer execute guest code; it is waiting for destruction.
+    Stopped,
     /// Returning lifecycle: result of `hv_vcpu_destroy`.
     Destroyed(bool),
 }
@@ -682,6 +720,34 @@ impl VcpuHandle {
             response_receiver,
             hvf_id,
             vcpu_thread: Some(vcpu_thread),
+        }
+    }
+
+    pub fn request_stop(&self) -> std::result::Result<(), String> {
+        self.send_event(VcpuEvent::Stop)
+            .map_err(|e| format!("send Stop: {e}"))?;
+        hvf::vcpu_request_exit(self.hvf_id).map_err(|e| format!("kick vCPU: {e:?}"))
+    }
+
+    pub fn wait_stopped(&self, deadline: Instant) -> std::result::Result<(), String> {
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err("vCPU stop timed out".into());
+            }
+            match self
+                .response_receiver
+                .recv_timeout(remaining.min(Duration::from_millis(10)))
+            {
+                Ok(VcpuResponse::Stopped) => return Ok(()),
+                // Another CPU may have exited after the event loop observed the first.
+                Ok(VcpuResponse::Exited(FC_EXIT_CODE_OK)) => {}
+                Err(RecvTimeoutError::Timeout) => {
+                    // HVF may have been entered just after the previous kick.
+                    hvf::vcpu_request_exit(self.hvf_id).map_err(|e| format!("kick vCPU: {e:?}"))?;
+                }
+                other => return Err(format!("vCPU stop response: {other:?}")),
+            }
         }
     }
 

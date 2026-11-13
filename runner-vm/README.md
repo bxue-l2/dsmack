@@ -22,6 +22,11 @@ agent over the `dsmack-ctl` port (`dstack-compat/README.md`). The app carries no
 new base image is a policy and manifest change. Base images and the application
 client (`applications/pilot-client`) live elsewhere in this repository.
 
+The native returning profile supports multiple vCPUs. On guest shutdown it
+stops every vCPU, joins the device workers, then destroys the VM before returning
+to the app for result finalization. The execution deadline remains active until
+every vCPU has stopped.
+
 ## Layout
 
 - `app-src/` Swift executable `mar` (packaged as `dsmack-runner`).
@@ -95,6 +100,23 @@ open -n -W --stdout out.log --stderr err.log DsmackRunner.app --args hvf-v3 "$OU
 (cd runner-vm/native/source-tree/apple-static/backend-v3 && cargo test)
 (cd runner-vm/control-src && swift test)
 python3 -m pytest runner-vm/guest-profile-source runner-vm/packaging
+```
+
+On Apple Silicon, exercise CPU startup, shutdown, timeouts and cancellation:
+
+```sh
+runner-vm/native/test-multicpu.sh
+```
+
+The script builds small ARM64 guests and ad-hoc signs the test executable with
+the Hypervisor entitlement. To also boot Linux, check that both CPUs are online
+and run parallel work pinned to each CPU, supply an ARM64 Linux `Image` with SMP
+and virtio-console support and a static ARM64 BusyBox:
+
+```sh
+DSMACK_TEST_LINUX_KERNEL=/path/to/Image \
+DSMACK_TEST_BUSYBOX=/path/to/busybox \
+runner-vm/native/test-multicpu.sh
 ```
 
 ## License

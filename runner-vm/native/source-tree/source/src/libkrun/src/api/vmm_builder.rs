@@ -105,7 +105,7 @@ impl<'a> VmmBuilder<'a> {
     /// Select the returning profile. The sole device is an output-only virtio console whose
     /// port owns a dup of `console_log`, which must be a regular file. [`build`](Self::build)
     /// then rejects caller devices, serial or kernel consoles, shutdown support, nested
-    /// virtualization, more than one vCPU and any payload other than verified owned bytes,
+    /// virtualization and any payload other than verified owned bytes,
     /// before any VM construction.
     pub fn returning_console(mut self, console_log: std::fs::File) -> Self {
         self.returning_console = Some(console_log);
@@ -609,7 +609,6 @@ impl Vmm<'_> {
             cancel,
         )
         .unwrap_or_else(|error| unrecoverable(&format!("teardown watchdog: {error}")));
-        vmm.lock().unwrap().cancel_exec_watchdog();
         let code = vmm
             .lock()
             .unwrap()
@@ -629,11 +628,10 @@ impl Vmm<'_> {
     }
 }
 
-/// Checks shared by the returning and control profiles: platform, vCPU count,
+/// Checks shared by the returning and control profiles: platform,
 /// verified owned payload, no options outside the profile, regular-file console.
 fn returning_checks(
     console_log: &std::fs::File,
-    vcpus: u8,
     payload: &Payload,
     extra_config: bool,
 ) -> Result<(), VmmError> {
@@ -641,9 +639,6 @@ fn returning_checks(
     let reject = |why: &str| Err(VmmError::BootError(format!("returning profile: {why}")));
     if !cfg!(all(target_arch = "aarch64", target_os = "macos")) {
         return reject("aarch64 macOS only");
-    }
-    if vcpus != 1 {
-        return reject("exactly one vCPU");
     }
     if !matches!(&payload.kind, PayloadKind::External { kernel } if kernel.verified().is_some()) {
         return reject("verified owned payload required");
@@ -662,11 +657,10 @@ fn returning_checks(
 
 fn returning_profile<'a>(
     console_log: std::fs::File,
-    vcpus: u8,
     payload: &Payload,
     extra_config: bool,
 ) -> Result<MmioDeviceManager<'a>, VmmError> {
-    returning_checks(&console_log, vcpus, payload, extra_config)?;
+    returning_checks(&console_log, payload, extra_config)?;
     let output = devices::virtio::port_io::output_to_raw_fd_dup(console_log.as_raw_fd())
         .map_err(|e| VmmError::Internal(format!("console dup: {e}")))?;
     drop(console_log);
@@ -692,7 +686,6 @@ pub const CONTROL_PORT_NAME: &str = "dsmack-ctl";
 #[cfg(all(feature = "blk", target_os = "macos"))]
 fn control_profile<'a>(
     console_log: std::fs::File,
-    vcpus: u8,
     payload: &Payload,
     extra_config: bool,
     control_fd: std::os::fd::OwnedFd,
@@ -701,7 +694,7 @@ fn control_profile<'a>(
     workload: Option<CtlDiskSpec>,
 ) -> Result<MmioDeviceManager<'a>, VmmError> {
     use std::os::fd::AsRawFd;
-    returning_checks(&console_log, vcpus, payload, extra_config)?;
+    returning_checks(&console_log, payload, extra_config)?;
     // v2 pairing rule: the disk triple is selected together or not at all.
     let Some(workload) = workload else {
         return Err(VmmError::BootError(
@@ -792,7 +785,7 @@ fn control_profile<'a>(
 /// system RO, vdb scratch RW, vdc workload RO, vdd result RW — its checked
 /// flush/sync wired into teardown — and optional vde private RO), and an
 /// OPTIONAL single bounded generic virtio-net device. Every `returning_checks`
-/// guard applies (aarch64 macOS, exactly one vCPU, verified owned payload,
+/// guard applies (aarch64 macOS, verified owned payload,
 /// regular-file console), and the control fd must be a socket or pipe. Every
 /// disk uses the owned-file route: the backend's exact verified inode is
 /// retained, never re-opened by path, never sparse-reinitialized — so a
@@ -801,7 +794,6 @@ fn control_profile<'a>(
 #[allow(clippy::too_many_arguments)]
 fn control_profile_v3<'a>(
     console_log: std::fs::File,
-    vcpus: u8,
     payload: &Payload,
     extra_config: bool,
     control_fd: std::os::fd::OwnedFd,
@@ -810,7 +802,7 @@ fn control_profile_v3<'a>(
     console_truncation: &mut Option<Arc<devices::virtio::port_io::ConsoleLimit>>,
 ) -> Result<MmioDeviceManager<'a>, VmmError> {
     use std::os::fd::AsRawFd;
-    returning_checks(&console_log, vcpus, payload, extra_config)?;
+    returning_checks(&console_log, payload, extra_config)?;
     if disks.is_empty() {
         return Err(VmmError::BootError(
             "returning profile: the v3 control profile requires the owned-file disk set".into(),
@@ -901,7 +893,6 @@ fn control_profile_v3<'a>(
 #[allow(clippy::too_many_arguments)]
 fn control_profile_v3<'a>(
     console_log: std::fs::File,
-    vcpus: u8,
     payload: &Payload,
     extra_config: bool,
     control_fd: std::os::fd::OwnedFd,
@@ -911,7 +902,6 @@ fn control_profile_v3<'a>(
 ) -> Result<MmioDeviceManager<'a>, VmmError> {
     let _ = (
         &console_log,
-        &vcpus,
         payload,
         &extra_config,
         &control_fd,
@@ -919,7 +909,7 @@ fn control_profile_v3<'a>(
         &net,
     );
     *console_truncation = None;
-    returning_checks(&console_log, vcpus, payload, extra_config)?;
+    returning_checks(&console_log, payload, extra_config)?;
     Err(VmmError::BootError(
         "returning profile: aarch64 macOS only".into(),
     ))
@@ -929,7 +919,6 @@ fn control_profile_v3<'a>(
 #[allow(clippy::too_many_arguments)]
 fn control_profile_v3<'a>(
     console_log: std::fs::File,
-    vcpus: u8,
     payload: &Payload,
     extra_config: bool,
     control_fd: std::os::fd::OwnedFd,
@@ -939,7 +928,6 @@ fn control_profile_v3<'a>(
 ) -> Result<MmioDeviceManager<'a>, VmmError> {
     let _ = (
         &console_log,
-        &vcpus,
         payload,
         &extra_config,
         &control_fd,
@@ -1050,7 +1038,6 @@ const SCRATCH_SPARSE_BYTES: u64 = 2 << 30;
 #[cfg(not(feature = "blk"))]
 fn control_profile<'a>(
     console_log: std::fs::File,
-    vcpus: u8,
     payload: &Payload,
     extra_config: bool,
     control_fd: std::os::fd::OwnedFd,
@@ -1060,7 +1047,6 @@ fn control_profile<'a>(
 ) -> Result<MmioDeviceManager<'a>, VmmError> {
     let _ = (
         &console_log,
-        &vcpus,
         &payload,
         &extra_config,
         &control_fd,
@@ -1079,7 +1065,6 @@ fn control_profile<'a>(
 #[cfg(all(feature = "blk", not(target_os = "macos")))]
 fn control_profile<'a>(
     console_log: std::fs::File,
-    vcpus: u8,
     payload: &Payload,
     extra_config: bool,
     control_fd: std::os::fd::OwnedFd,
@@ -1089,7 +1074,6 @@ fn control_profile<'a>(
 ) -> Result<MmioDeviceManager<'a>, VmmError> {
     let _ = (
         &console_log,
-        &vcpus,
         &payload,
         &extra_config,
         &control_fd,
@@ -1233,7 +1217,6 @@ fn build_vm(mut builder_cfg: VmmBuilder<'_>) -> Result<Vmm<'_>, VmmError> {
                 })?;
                 Some(control_profile_v3(
                     file,
-                    vcpus_count,
                     &payload,
                     extra,
                     control,
@@ -1248,7 +1231,6 @@ fn build_vm(mut builder_cfg: VmmBuilder<'_>) -> Result<Vmm<'_>, VmmError> {
                 match (builder_cfg.ctl_channel, builder_cfg.ctl_disk) {
                     (Some(fd), Some(disk)) => Some(control_profile(
                         file,
-                        vcpus_count,
                         &payload,
                         extra,
                         fd,
@@ -1256,7 +1238,7 @@ fn build_vm(mut builder_cfg: VmmBuilder<'_>) -> Result<Vmm<'_>, VmmError> {
                         builder_cfg.ctl_scratch.take(),
                         builder_cfg.ctl_workload.take(),
                     )?),
-                    (None, None) => Some(returning_profile(file, vcpus_count, &payload, extra)?),
+                    (None, None) => Some(returning_profile(file, &payload, extra)?),
                     (Some(_), None) | (None, Some(_)) => {
                         return Err(VmmError::BootError(
                             "returning profile: the control channel and the authenticated disk \
